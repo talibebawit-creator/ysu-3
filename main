@@ -1,560 +1,196 @@
 #!/usr/bin/env python3
-# Combined single-file bot: DB + handlers + main
-# Put this file in repo root as main.py.
-
-import os
-import sqlite3
-import time
-import json
-import logging
 import asyncio
+import logging
+import signal
+from typing import List
 
-from typing import Optional, List
+from aiogram import Bot, Dispatcher
+from aiogram.types import (
+    Message,
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    BotCommand,
+    LabeledPrice,
+    PreCheckoutQuery,
+)
+from aiogram.enums import ParseMode
+from aiogram.filters import Command
 
-from aiogram import Bot, Dispatcher, types
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, BotCommand, LabeledPrice, ParseMode
-from aiogram.utils import executor
+# -----------------------
+# Конфигурация (inlined)
+# -----------------------
+# Вставлены ваши значения
+TOKEN: str = "8304973464:AAGEcZ5nD2dO3XKgJznyhJs5TUeYqQb83hQ"  # Ваш токен бота
+PROVIDER_TOKEN: str = ""  # Токен провайдера платежей (оставьте пустым, если не используете платежи)
+DEFAULT_CURRENCY: str = "USD"  # Валюта, например "USD" или "RUB"
+PRODUCT_PRICE_AMOUNT: int = 100  # Сумма в минимальных единицах (cents). 100 -> 1.00
+PRODUCT_LABEL: str = "Test product"
 
-# ====== CONFIG (ВНИМАНИЕ: токен в явном виде — небезопасно) ======
-BOT_TOKEN = "8304973464:AAGEcZ5nD2dO3XKgJznyhJs5TUeYqQb83hQ"
+# Информация о владельце/админе
+OWNER_ID: int = 6101005448
+OWNER_USERNAME: str = "@dvestl"
+ADMINS: List[int] = [OWNER_ID]  # Список admin user_id
 
-# Владелец/со-владелец
-OWNER_IDS = [6101005448]
-OWNER_USERNAMES = {
-    6101005448: "dvestl"
-}
-
-# PAYMENT_PROVIDER_TOKEN (для Telegram invoices), пусто если не используете
-PAYMENT_PROVIDER_TOKEN = ""
-CURRENCY = "USD"
-PRICE_PER_STAR_CENTS = 100
-PACKAGES = [
-    {"stars": 10, "coins": 500},
-    {"stars": 25, "coins": 1400},
-    {"stars": 60, "coins": 3600},
-]
-# ================================================================
-
+# -----------------------
+# Логирование
+# -----------------------
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("tg-bot")
+logger = logging.getLogger(__name__)
 
-# ====== Simple SQLite DB layer (embedded) ======
-_db_conn: Optional[sqlite3.Connection] = None
+if not TOKEN:
+    logger.error("TG_BOT_TOKEN не задан. Установите значение TOKEN в файле перед запуском.")
+    raise SystemExit("TG_BOT_TOKEN required")
 
-def db_init(path: str = "db.sqlite"):
-    global _db_conn
-    _db_conn = sqlite3.connect(path, check_same_thread=False)
-    _db_conn.row_factory = sqlite3.Row
-    cur = _db_conn.cursor()
-    cur.execute('''
-    CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY,
-        username TEXT,
-        balance INTEGER DEFAULT 0,
-        stars INTEGER DEFAULT 0,
-        vip INTEGER DEFAULT 0,
-        vip_expiry INTEGER DEFAULT 0,
-        last_bonus INTEGER DEFAULT 0,
-        last_vip_bonus INTEGER DEFAULT 0,
-        created_at INTEGER
-    )
-    ''')
-    cur.execute('''
-    CREATE TABLE IF NOT EXISTS admins (
-        user_id INTEGER PRIMARY KEY,
-        granted_by INTEGER,
-        granted_at INTEGER
-    )
-    ''')
-    cur.execute('''
-    CREATE TABLE IF NOT EXISTS transfers (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        from_user INTEGER,
-        to_user INTEGER,
-        amount INTEGER,
-        reason TEXT,
-        status TEXT,
-        created_at INTEGER
-    )
-    ''')
-    cur.execute('''
-    CREATE TABLE IF NOT EXISTS spins (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        chat_id INTEGER,
-        number INTEGER,
-        color TEXT,
-        created_at INTEGER
-    )
-    ''')
-    _db_conn.commit()
-
-def _now_ts() -> int:
-    return int(time.time())
-
-def ensure_user(user_id: int, username: Optional[str] = None):
-    cur = _db_conn.cursor()
-    cur.execute('SELECT id FROM users WHERE id = ?', (user_id,))
-    if cur.fetchone() is None:
-        cur.execute('INSERT INTO users (id, username, balance, stars, vip, vip_expiry, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
-                    (user_id, username or None, 0, 0, 0, 0, _now_ts()))
-        _db_conn.commit()
-
-def get_user(user_id: int):
-    cur = _db_conn.cursor()
-    cur.execute('SELECT * FROM users WHERE id = ?', (user_id,))
-    return cur.fetchone()
-
-def update_username(user_id: int, username: str):
-    cur = _db_conn.cursor()
-    cur.execute('UPDATE users SET username = ? WHERE id = ?', (username, user_id))
-    _db_conn.commit()
-
-# Balance
-def add_coins(to_user: int, amount: int, reason: Optional[str] = None, from_user: Optional[int] = None) -> bool:
-    if amount <= 0:
-        return False
-    ensure_user(to_user)
-    cur = _db_conn.cursor()
-    cur.execute('UPDATE users SET balance = balance + ? WHERE id = ?', (amount, to_user))
-    cur.execute('INSERT INTO transfers (from_user, to_user, amount, reason, status, created_at) VALUES (?, ?, ?, ?, ?, ?)',
-                (from_user, to_user, amount, reason or 'add_coins', 'done', _now_ts()))
-    _db_conn.commit()
-    return True
-
-def get_balance(user_id: int) -> int:
-    ensure_user(user_id)
-    cur = _db_conn.cursor()
-    cur.execute('SELECT balance FROM users WHERE id = ?', (user_id,))
-    row = cur.fetchone()
-    return int(row['balance']) if row else 0
-
-# Stars
-def add_stars(user_id: int, amount: int) -> bool:
-    if amount <= 0:
-        return False
-    ensure_user(user_id)
-    cur = _db_conn.cursor()
-    cur.execute('UPDATE users SET stars = stars + ? WHERE id = ?', (amount, user_id))
-    cur.execute('INSERT INTO transfers (from_user, to_user, amount, reason, status, created_at) VALUES (?, ?, ?, ?, ?, ?)',
-                (None, user_id, amount, 'add_stars', 'done', _now_ts()))
-    _db_conn.commit()
-    return True
-
-def get_stars(user_id: int) -> int:
-    ensure_user(user_id)
-    cur = _db_conn.cursor()
-    cur.execute('SELECT stars FROM users WHERE id = ?', (user_id,))
-    row = cur.fetchone()
-    return int(row['stars']) if row else 0
-
-def spend_stars(user_id: int, amount: int) -> bool:
-    if amount <= 0:
-        return False
-    ensure_user(user_id)
-    cur = _db_conn.cursor()
-    cur.execute('SELECT stars FROM users WHERE id = ?', (user_id,))
-    row = cur.fetchone()
-    if not row or row['stars'] < amount:
-        return False
-    try:
-        cur.execute('BEGIN')
-        cur.execute('UPDATE users SET stars = stars - ? WHERE id = ?', (amount, user_id))
-        cur.execute('INSERT INTO transfers (from_user, to_user, amount, reason, status, created_at) VALUES (?, ?, ?, ?, ?, ?)',
-                    (user_id, None, -amount, 'spend_stars', 'done', _now_ts()))
-        _db_conn.commit()
-        return True
-    except Exception:
-        _db_conn.rollback()
-        return False
-
-# VIP monthly
-MONTH_SECONDS = 30 * 24 * 3600
-def set_vip_months(user_id: int, months: int = 1):
-    ensure_user(user_id)
-    cur = _db_conn.cursor()
-    now = _now_ts()
-    expiry = now + months * MONTH_SECONDS
-    cur.execute('UPDATE users SET vip = 1, vip_expiry = ? WHERE id = ?', (expiry, user_id))
-    cur.execute('INSERT INTO transfers (from_user, to_user, amount, reason, status, created_at) VALUES (?, ?, ?, ?, ?, ?)',
-                (None, user_id, 0, 'vip_purchase', 'done', now))
-    _db_conn.commit()
-
-def is_vip(user_id: int) -> bool:
-    ensure_user(user_id)
-    cur = _db_conn.cursor()
-    cur.execute('SELECT vip_expiry FROM users WHERE id = ?', (user_id,))
-    row = cur.fetchone()
-    expiry = int(row['vip_expiry']) if row and row['vip_expiry'] else 0
-    return expiry > _now_ts()
-
-def get_vip_expiry(user_id: int) -> int:
-    ensure_user(user_id)
-    cur = _db_conn.cursor()
-    cur.execute('SELECT vip_expiry FROM users WHERE id = ?', (user_id,))
-    row = cur.fetchone()
-    return int(row['vip_expiry']) if row and row['vip_expiry'] else 0
-
-# Transfers & list
-def list_transfers(limit: int = 50):
-    cur = _db_conn.cursor()
-    cur.execute('SELECT * FROM transfers ORDER BY id DESC LIMIT ?', (limit,))
-    return cur.fetchall()
-
-def list_top_users(limit: int = 10):
-    cur = _db_conn.cursor()
-    cur.execute('SELECT id, username, balance, stars FROM users ORDER BY balance DESC LIMIT ?', (limit,))
-    return cur.fetchall()
-
-# Bonus rules
-BONUS_AMOUNT = 5000
-BONUS_COOLDOWN = 10 * 3600
-VIP_BONUS_AMOUNT = 15000
-VIP_BONUS_COOLDOWN = 5 * 3600
-
-def can_claim_bonus(user_id: int) -> bool:
-    ensure_user(user_id)
-    cur = _db_conn.cursor()
-    if is_vip(user_id):
-        cur.execute('SELECT last_vip_bonus FROM users WHERE id = ?', (user_id,))
-        row = cur.fetchone()
-        last = int(row['last_vip_bonus']) if row and row['last_vip_bonus'] else 0
-        return (_now_ts() - last) >= VIP_BONUS_COOLDOWN
-    else:
-        cur.execute('SELECT last_bonus FROM users WHERE id = ?', (user_id,))
-        row = cur.fetchone()
-        last = int(row['last_bonus']) if row and row['last_bonus'] else 0
-        return (_now_ts() - last) >= BONUS_COOLDOWN
-
-def time_until_next_bonus(user_id: int) -> int:
-    ensure_user(user_id)
-    cur = _db_conn.cursor()
-    if is_vip(user_id):
-        cur.execute('SELECT last_vip_bonus FROM users WHERE id = ?', (user_id,))
-        row = cur.fetchone()
-        last = int(row['last_vip_bonus']) if row and row['last_vip_bonus'] else 0
-        diff = VIP_BONUS_COOLDOWN - (_now_ts() - last)
-        return diff if diff > 0 else 0
-    else:
-        cur.execute('SELECT last_bonus FROM users WHERE id = ?', (user_id,))
-        row = cur.fetchone()
-        last = int(row['last_bonus']) if row and row['last_bonus'] else 0
-        diff = BONUS_COOLDOWN - (_now_ts() - last)
-        return diff if diff > 0 else 0
-
-def claim_bonus(user_id: int) -> bool:
-    ensure_user(user_id)
-    now = _now_ts()
-    cur = _db_conn.cursor()
-    try:
-        if is_vip(user_id):
-            if not can_claim_bonus(user_id):
-                return False
-            cur.execute('BEGIN')
-            cur.execute('UPDATE users SET balance = balance + ?, last_vip_bonus = ? WHERE id = ?', (VIP_BONUS_AMOUNT, now, user_id))
-            cur.execute('INSERT INTO transfers (from_user, to_user, amount, reason, status, created_at) VALUES (?, ?, ?, ?, ?, ?)',
-                        (None, user_id, VIP_BONUS_AMOUNT, 'vip_bonus_5h', 'done', now))
-            _db_conn.commit()
-            return True
-        else:
-            if not can_claim_bonus(user_id):
-                return False
-            cur.execute('BEGIN')
-            cur.execute('UPDATE users SET balance = balance + ?, last_bonus = ? WHERE id = ?', (BONUS_AMOUNT, now, user_id))
-            cur.execute('INSERT INTO transfers (from_user, to_user, amount, reason, status, created_at) VALUES (?, ?, ?, ?, ?, ?)',
-                        (None, user_id, BONUS_AMOUNT, 'bonus_10h', 'done', now))
-            _db_conn.commit()
-            return True
-    except Exception:
-        _db_conn.rollback()
-        return False
-
-# ====== Handlers (in-file) ======
-async def start_cmd(message: types.Message):
-    bot_username = (await message.bot.get_me()).username
-    link = f"https://t.me/{bot_username}?start=commands"
-    text = (
-        "Привет! 👋\n\n"
-        "Я бот для управления COINS и игр.\n"
-        "Чтобы увидеть список команд, нажмите на слово "
-        f"<a href=\"{link}\">команды</a> — я открою диалог со мной.\n\n"
-        "Если вы добавили бота в группу, нажмите на ссылку и откройте личный чат для покупок/приватных команд."
-    )
-    ensure_user(message.from_user.id, getattr(message.from_user, "username", None))
-    await message.reply(text, parse_mode=ParseMode.HTML)
-
-async def my_chat_member_handler(update: types.ChatMemberUpdated):
-    new = update.new_chat_member
-    if not new or not new.user or not new.user.is_bot:
-        return
-    bot_username = (await update.bot.get_me()).username
-    if new.status in ("member", "administrator"):
-        link = f"https://t.me/{bot_username}?start=commands"
-        text = (
-            "Спасибо, что добавили меня в чат! 🤖\n\n"
-            "Чтобы открыть личный чат со мной и посмотреть команды, нажмите: "
-            f"<a href=\"{link}\">команды</a>\n\n"
-            "Рекомендуется открыть диалог со мной в личных сообщениях."
-        )
-        try:
-            await update.bot.send_message(update.chat.id, text, parse_mode=ParseMode.HTML)
-        except Exception:
-            pass
-
-async def contact_admins_cmd(message: types.Message):
-    cur = _db_conn.cursor()
-    cur.execute('SELECT user_id FROM admins')
-    admin_rows = [r['user_id'] for r in cur.fetchall()]
-    admin_ids = list(dict.fromkeys(OWNER_IDS + admin_rows))
-    if not admin_ids:
-        await message.reply("Администраторы не настроены.")
-        return
-    kb = InlineKeyboardMarkup(row_width=1)
-    lines = []
-    for aid in admin_ids:
-        row = get_user(aid)
-        username = row['username'] if row else None
-        if username:
-            kb.add(InlineKeyboardButton(f'Написать @{username}', url=f'tg://user?id={aid}'))
-            display = f'@{username}'
-            lines.append(f'<a href="tg://user?id={aid}">@{username}</a> — {display}')
-        else:
-            kb.add(InlineKeyboardButton(f'Написать {aid}', url=f'tg://user?id={aid}'))
-            lines.append(f'<a href="tg://user?id={aid}">Админ {aid}</a> — {aid}')
-    text = 'Связь с администрацией:\n\n' + '\n'.join(lines)
-    await message.reply(text, parse_mode=ParseMode.HTML, reply_markup=kb)
-
-async def cmd_buy(message: types.Message):
-    kb = InlineKeyboardMarkup(row_width=1)
-    for idx, pkg in enumerate(PACKAGES):
-        title = f"{pkg['stars']} ⭐ → {pkg['coins']:,} COINS"
-        kb.add(InlineKeyboardButton(title, callback_data=f"buy_pkg|{idx}"))
-    kb.add(InlineKeyboardButton("Отмена", callback_data="buy_cancel"))
-    await message.reply("Выберите пакет звезд для покупки (оплата через Telegram):", reply_markup=kb)
-
-async def callback_buy(cb: types.CallbackQuery):
-    data = cb.data or ""
-    parts = data.split("|")
-    if parts[0] == "buy_pkg" and len(parts) >= 2:
-        idx = int(parts[1])
-        if idx < 0 or idx >= len(PACKAGES):
-            await cb.answer("Пакет не найден", show_alert=True)
-            return
-        pkg = PACKAGES[idx]
-        stars = pkg['stars']
-        coins = pkg['coins']
-        if not PAYMENT_PROVIDER_TOKEN:
-            await cb.answer("PAYMENT_PROVIDER_TOKEN не настроен", show_alert=True)
-            return
-        amount = stars * PRICE_PER_STAR_CENTS
-        prices = [LabeledPrice(label=f"{stars} ⭐ (→ {coins:,} COINS)", amount=amount)]
-        payload = f"purchase|{idx}|{cb.from_user.id}"
-        try:
-            await cb.bot.send_invoice(
-                chat_id=cb.from_user.id,
-                title=f"Пакет {stars} ⭐",
-                description=f"Получите {coins:,} COINS (пакет {stars} stars)",
-                payload=payload,
-                provider_token=PAYMENT_PROVIDER_TOKEN,
-                currency=CURRENCY,
-                prices=prices,
-                start_parameter=f"buy_stars_{idx}",
+# -----------------------
+# Обработчики
+# -----------------------
+async def start_handler(message: Message) -> None:
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(
+                text=f"Купить {PRODUCT_LABEL} ({PRODUCT_PRICE_AMOUNT/100:.2f} {DEFAULT_CURRENCY})",
+                callback_data="buy:test"
             )
-            await cb.answer("Счёт отправлен в ЛС. Пожалуйста, завершите оплату там.")
-        except Exception as e:
-            await cb.answer("Ошибка отправки инвойса: " + str(e), show_alert=True)
-    elif parts[0] == "buy_cancel":
-        try:
-            await cb.message.edit_text("Операция покупки отменена")
-        except Exception:
-            pass
-    else:
-        await cb.answer()
+        ],
+    ])
+    await message.answer(
+        "<b>Привет!</b>\n\n"
+        "Это рабочий бот на aiogram v3.\n"
+        "Нажмите кнопку, чтобы получить инвойс (тестовый платёж).\n\n"
+        "Команды: /start /pay /help /owner",
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb,
+    )
 
-async def pre_checkout_query(pre: types.PreCheckoutQuery):
-    await pre.answer(ok=True)
 
-async def successful_payment(message: types.Message):
-    pay = message.successful_payment
-    payload = pay.invoice_payload
+async def help_handler(message: Message) -> None:
+    await message.answer("Помощь:\n/start — старт\n/pay — отправить инвойс\n/help — эта справка\n/owner — информация о владельце")
+
+
+async def pay_command_handler(message: Message) -> None:
+    prices = [LabeledPrice(label=PRODUCT_LABEL, amount=PRODUCT_PRICE_AMOUNT)]
     try:
-        parts = payload.split("|")
-        if parts[0] != "purchase":
-            return
-        idx = int(parts[1])
-        buyer_id = int(parts[2])
+        await message.bot.send_invoice(
+            chat_id=message.chat.id,
+            title=PRODUCT_LABEL,
+            description="Описание тестового товара",
+            payload=f"payload:{message.from_user.id}",
+            provider_token=PROVIDER_TOKEN,
+            currency=DEFAULT_CURRENCY,
+            prices=prices,
+        )
+    except Exception as exc:
+        logger.exception("Failed to send invoice: %s", exc)
+        await message.answer("Не удалось отправить инвойс. Проверьте PROVIDER_TOKEN и настройки платежей.")
+
+
+async def callback_buy_handler(callback: CallbackQuery) -> None:
+    await callback.answer()
+    prices = [LabeledPrice(label=PRODUCT_LABEL, amount=PRODUCT_PRICE_AMOUNT)]
+    try:
+        await callback.message.bot.send_invoice(
+            chat_id=callback.message.chat.id,
+            title=PRODUCT_LABEL,
+            description="Оплата через Inline-кнопку",
+            payload=f"payload_cb:{callback.from_user.id}",
+            provider_token=PROVIDER_TOKEN,
+            currency=DEFAULT_CURRENCY,
+            prices=prices,
+        )
+    except Exception as exc:
+        logger.exception("send_invoice failed: %s", exc)
+        await callback.message.answer("Не удалось открыть платёж. Проверьте настройки.")
+
+
+async def pre_checkout_query_handler(pre_checkout: PreCheckoutQuery) -> None:
+    try:
+        await pre_checkout.answer(ok=True)
     except Exception:
+        logger.exception("Failed to answer pre_checkout")
+
+
+async def successful_payment_handler(message: Message) -> None:
+    payment = getattr(message, "successful_payment", None)
+    if payment:
+        await message.answer(
+            "Платёж успешно выполнен!\n\n"
+            f"Сумма: {payment.total_amount / 100:.2f} {payment.currency}\n"
+            f"Payload: {payment.invoice_payload}"
+        )
+        logger.info("Payment successful: %s", payment)
+
+
+async def owner_handler(message: Message) -> None:
+    await message.answer(f"Владелец бота: {OWNER_USERNAME} (id: {OWNER_ID})")
+
+
+async def admin_only_handler(message: Message) -> None:
+    user_id = message.from_user.id
+    if user_id not in ADMINS:
+        await message.answer("У вас нет доступа к этой команде.")
         return
-    if message.from_user.id != buyer_id:
-        return
-    if idx < 0 or idx >= len(PACKAGES):
-        return
-    pkg = PACKAGES[idx]
-    coins = pkg['coins']
-    stars = pkg['stars']
-    add_coins(buyer_id, coins, reason='purchase_stars', from_user=None)
-    add_stars(buyer_id, stars)
-    await message.reply(f"Оплата получена ✅\nВам зачислено {coins:,} COINS и {stars} ⭐ (пакет).")
+    await message.answer("Команда доступна админам.")
 
-VIP_COST = 120  # stars for 1 month
 
-async def cmd_buy_vip(message: types.Message):
-    uid = message.from_user.id
-    ensure_user(uid, getattr(message.from_user, "username", None))
-    stars = get_stars(uid)
-    if stars < VIP_COST:
-        await message.reply(f"У вас недостаточно ⭐ для покупки VIP за 120 ⭐. Нужно {VIP_COST}, у вас {stars}.")
-        return
-    kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton("Купить VIP (1 месяц) за 120 ⭐", callback_data=f"confirm_vip|{uid}"))
-    kb.add(InlineKeyboardButton("Отмена", callback_data=f"cancel_vip|{uid}"))
-    await message.reply(f"Подтвердите покупку VIP на 1 месяц за {VIP_COST} ⭐ (повышение выигрыша на +50%).", reply_markup=kb)
+# -----------------------
+# Запуск бота
+# -----------------------
+async def main() -> None:
+    bot = Bot(token=TOKEN, parse_mode=ParseMode.HTML)
+    dp = Dispatcher()
 
-async def callback_vip(cb: types.CallbackQuery):
-    data = cb.data or ""
-    parts = data.split("|")
-    action = parts[0]
-    if action == "confirm_vip" and len(parts) >= 2:
-        initiator = int(parts[1])
-        if cb.from_user.id != initiator:
-            await cb.answer("Только инициатор может подтвердить", show_alert=True)
-            return
-        ok = spend_stars(initiator, VIP_COST)
-        if not ok:
-            await cb.message.edit_text("Ошибка: недостаточно звезд или внутренняя ошибка")
-            return
-        set_vip_months(initiator, months=1)
-        await cb.message.edit_text("Успех ✅\nВы купили VIP на 1 месяц. Ваши выигрыши будут умножаться на 1.5.")
-    elif action == "cancel_vip":
-        try:
-            await cb.message.edit_text("Покупка отменена")
-        except Exception:
-            pass
-    else:
-        await cb.answer()
+    # Регистрируем обработчики
+    dp.message.register(start_handler, Command(commands=["start"]))
+    dp.message.register(help_handler, Command(commands=["help"]))
+    dp.message.register(pay_command_handler, Command(commands=["pay"]))
+    dp.message.register(owner_handler, Command(commands=["owner"]))
+    dp.callback_query.register(callback_buy_handler, lambda c: c.data and c.data.startswith("buy:"))
+    dp.pre_checkout_query.register(pre_checkout_query_handler)
+    dp.message.register(successful_payment_handler, lambda m: getattr(m, "successful_payment", None) is not None)
+    dp.message.register(admin_only_handler, Command(commands=["admin"]))
 
-async def cmd_vip_status(message: types.Message):
-    uid = message.from_user.id
-    ensure_user(uid, getattr(message.from_user, "username", None))
-    vip = is_vip(uid)
-    stars = get_stars(uid)
-    if vip:
-        exp = get_vip_expiry(uid)
-        from datetime import datetime
-        exp_fmt = datetime.utcfromtimestamp(exp).strftime("%Y-%m-%d %H:%M UTC")
-        await message.reply(f"VIP: Да\nДействует до: {exp_fmt}\n⭐ Stars: {stars}")
-    else:
-        await message.reply(f"VIP: Нет\n⭐ Stars: {stars}")
-
-def _format_seconds(sec: int) -> str:
-    if sec <= 0:
-        return "0s"
-    h, rem = divmod(sec, 3600)
-    m, s = divmod(rem, 60)
-    parts = []
-    if h:
-        parts.append(f"{h}h")
-    if m:
-        parts.append(f"{m}m")
-    if s and not parts:
-        parts.append(f"{s}s")
-    return " ".join(parts)
-
-async def cmd_bonus(message: types.Message):
-    uid = message.from_user.id
-    ensure_user(uid, getattr(message.from_user, "username", None))
-    if can_claim_bonus(uid):
-        ok = claim_bonus(uid)
-        if ok:
-            bal = get_balance(uid)
-            if is_vip(uid):
-                await message.reply(f"Вы получили VIP бонус {VIP_BONUS_AMOUNT} COINS!\nТекущий баланс: {bal} COINS")
-            else:
-                await message.reply(f"Вы получили бонус {BONUS_AMOUNT} COINS!\nТекущий баланс: {bal} COINS")
-        else:
-            await message.reply("Ошибка при выдаче бонуса. Попробуйте позже.")
-    else:
-        wait = time_until_next_bonus(uid)
-        hrs = "5" if is_vip(uid) else "10"
-        await message.reply(f"Бонус можно получить раз в {hrs} часов. Оставшееся время: {_format_seconds(wait)}")
-
-async def cmd_bonus_status(message: types.Message):
-    uid = message.from_user.id
-    ensure_user(uid, getattr(message.from_user, "username", None))
-    can = can_claim_bonus(uid)
-    wait = time_until_next_bonus(uid)
-    stars = get_stars(uid)
-    vip = is_vip(uid)
-    await message.reply(f"Бонус доступен: {'Да' if can else 'Нет'}\nОставшееся время: {_format_seconds(wait)}\n⭐ Stars: {stars}\nVIP: {'Да' if vip else 'Нет'}")
-
-async def cmd_top(message: types.Message):
-    limit = 10
-    rows = list_top_users(limit=limit)
-    if not rows:
-        await message.reply("Пока нет игроков в таблице.")
-        return
-    lines = ["🏅 Топ игроков:"]
-    for i, r in enumerate(rows, start=1):
-        uid = int(r["id"])
-        bal = int(r["balance"])
-        vip = is_vip(uid)
-        if r["username"]:
-            display = "@" + r["username"]
-        else:
-            display = f'<a href="tg://user?id={uid}">User {uid}</a>'
-        vip_tag = " (VIP)" if vip else ""
-        lines.append(f"{i}. {display} — {bal:,} COINS{vip_tag}")
-    await message.reply("\n".join(lines), parse_mode=ParseMode.HTML)
-
-def register_handlers(dp: Dispatcher):
-    dp.register_message_handler(start_cmd, commands=["start"])
+    # Устанавливаем команды бота
     try:
-        dp.register_my_chat_member_handler(my_chat_member_handler)
+        await bot.set_my_commands([
+            BotCommand(command="start", description="Start bot"),
+            BotCommand(command="pay", description="Get invoice"),
+            BotCommand(command="help", description="Help"),
+            BotCommand(command="owner", description="Owner info"),
+            BotCommand(command="admin", description="Admin only command"),
+        ])
     except Exception:
+        logger.exception("Не удалось установить команды бота")
+
+    # Graceful shutdown setup
+    stop_event = asyncio.Event()
+
+    def _signal_handler(*_) -> None:
+        stop_event.set()
+
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
         try:
-            dp.register_chat_member_handler(my_chat_member_handler)
-        except Exception:
+            loop.add_signal_handler(sig, _signal_handler)
+        except NotImplementedError:
             pass
-    dp.register_message_handler(contact_admins_cmd, commands=["contact", "contact_admins"])
-    dp.register_message_handler(contact_admins_cmd, lambda m: m.text and m.text.strip().lower() == "связь с администрацией")
-    dp.register_message_handler(cmd_buy, commands=["buy", "shop"])
-    dp.register_callback_query_handler(callback_buy, lambda c: c.data and (c.data.startswith("buy_") or c.data.startswith("buy_pkg")))
-    dp.register_pre_checkout_query_handler(pre_checkout_query)
-    dp.register_message_handler(successful_payment, content_types=["successful_payment"])
-    dp.register_message_handler(cmd_buy_vip, commands=["buy_vip", "vip_buy"])
-    dp.register_message_handler(cmd_vip_status, commands=["vip_status", "vip"])
-    dp.register_callback_query_handler(callback_vip, lambda c: c.data and (c.data.startswith("confirm_vip") or c.data.startswith("cancel_vip")))
-    dp.register_message_handler(cmd_bonus, commands=["bonus", "claim_bonus"])
-    dp.register_message_handler(cmd_bonus_status, commands=["bonus_status"])
-    dp.register_message_handler(cmd_top, commands=["top"])
-    dp.register_message_handler(cmd_top, lambda m: m.text and m.text.strip().lower() == "топ")
 
-async def set_commands(bot: Bot):
-    commands = [
-        BotCommand(command="start", description="Запуск / инструкция"),
-        BotCommand(command="help", description="Справка по командам"),
-        BotCommand(command="balance", description="Показать баланс"),
-        BotCommand(command="buy", description="Купить пакеты"),
-        BotCommand(command="bonus", description="Взять бонус"),
-        BotCommand(command="vip", description="Статус VIP / купить VIP"),
-        BotCommand(command="top", description="Топ игроков"),
-        BotCommand(command="contact", description="Связь с администрацией"),
-    ]
+    polling_task = asyncio.create_task(dp.start_polling(bot))
+
+    await stop_event.wait()
+    logger.info("Shutdown signal received, stopping polling...")
+    polling_task.cancel()
     try:
-        await bot.set_my_commands(commands)
-    except Exception as e:
-        logger.warning("set_my_commands failed: %s", e)
+        await polling_task
+    except asyncio.CancelledError:
+        pass
+    finally:
+        await bot.session.close()
+        logger.info("Bot session closed")
 
-def main():
-    if BOT_TOKEN.startswith("REPLACE") or not BOT_TOKEN:
-        raise SystemExit("Please edit main.py and set BOT_TOKEN at the top before running.")
-    db_init("db.sqlite")
-    bot = Bot(token=BOT_TOKEN)
-    dp = Dispatcher(bot)
-    register_handlers(dp)
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(set_commands(bot))
-    logger.info("Starting polling...")
-    executor.start_polling(dp, skip_updates=True)
 
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Exit")
