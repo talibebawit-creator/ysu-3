@@ -16,6 +16,7 @@ from aiogram.types import (
 )
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
+from aiogram.client.bot import DefaultBotProperties
 
 # -----------------------
 # Конфигурация (inlined)
@@ -137,7 +138,8 @@ async def admin_only_handler(message: Message) -> None:
 # Запуск бота
 # -----------------------
 async def main() -> None:
-    bot = Bot(token=TOKEN, parse_mode=ParseMode.HTML)
+    # Используем DefaultBotProperties для совместимости с aiogram 3.7+
+    bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher()
 
     # Регистрируем обработчики
