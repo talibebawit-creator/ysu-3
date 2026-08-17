@@ -19,6 +19,7 @@ from aiogram.types import (
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
 from aiogram.client.bot import DefaultBotProperties
+from aiogram.exceptions import TelegramBadRequest
 
 load_dotenv()
 
@@ -69,6 +70,9 @@ if not BOT_TOKEN:
     logger.error("BOT_TOKEN не задан. Создайте файл .env и добавьте BOT_TOKEN=...")
     raise SystemExit("BOT_TOKEN required")
 
+# Runtime flag: disable payments if provider invalid to avoid spam errors
+payments_enabled = True
+
 # -----------------------
 # Обработчики
 # -----------------------
@@ -96,8 +100,9 @@ async def help_handler(message: Message) -> None:
 
 
 async def pay_command_handler(message: Message) -> None:
-    if not PROVIDER_TOKEN:
-        await message.answer("Платежный провайдер не настроен. Установите PROVIDER_TOKEN в .env, если хотите тестировать платежи.")
+    global payments_enabled
+    if not PROVIDER_TOKEN or not payments_enabled:
+        await message.answer("Платежи временно недоступны. Свяжитесь с администратором.")
         return
     prices = [LabeledPrice(label=PRODUCT_LABEL, amount=PRODUCT_PRICE_AMOUNT)]
     try:
@@ -110,15 +115,37 @@ async def pay_command_handler(message: Message) -> None:
             currency=DEFAULT_CURRENCY,
             prices=prices,
         )
-    except Exception as exc:
+    except TelegramBadRequest as exc:
         logger.exception("Failed to send invoice: %s", exc)
-        await message.answer("Не удалось отправить инвойс. Проверьте PROVIDER_TOKEN и настройки платежей.")
+        msg = str(exc)
+        # If provider token is invalid, disable payments to avoid repeated errors
+        if "PAYMENT_PROVIDER_INVALID" in msg.upper():
+            payments_enabled = False
+            # notify owner/admin if configured
+            notify_text = (
+                "[Auto] Ошибка платежного провайдера: PAYMENT_PROVIDER_INVALID.\n"
+                "Проверьте PROVIDER_TOKEN в .env и настройки в BotFather.\n"
+                f"Ошибка: {msg}"
+            )
+            if OWNER_ID:
+                try:
+                    await message.bot.send_message(OWNER_ID, notify_text)
+                except Exception:
+                    logger.exception("Failed to notify owner about invalid payment provider")
+            await message.answer("Ошибка платежного провайдера. Администратор уведомлён, платежи отключены.")
+            return
+        # other TelegramBadRequest
+        await message.answer("Не удалось отправить инвойс. Попробуйте позже.")
+    except Exception:
+        logger.exception("Unexpected error when sending invoice")
+        await message.answer("Внутренняя ошибка при формировании инвойса.")
 
 
 async def callback_buy_handler(callback: CallbackQuery) -> None:
+    global payments_enabled
     await callback.answer()
-    if not PROVIDER_TOKEN:
-        await callback.message.answer("Платёжный провайдер не настроен.")
+    if not PROVIDER_TOKEN or not payments_enabled:
+        await callback.message.answer("Платежи временно недоступны. Свяжитесь с администратором.")
         return
     prices = [LabeledPrice(label=PRODUCT_LABEL, amount=PRODUCT_PRICE_AMOUNT)]
     try:
@@ -131,9 +158,27 @@ async def callback_buy_handler(callback: CallbackQuery) -> None:
             currency=DEFAULT_CURRENCY,
             prices=prices,
         )
-    except Exception as exc:
+    except TelegramBadRequest as exc:
         logger.exception("send_invoice failed: %s", exc)
-        await callback.message.answer("Не удалось открыть платёж. Проверьте настройки.")
+        msg = str(exc)
+        if "PAYMENT_PROVIDER_INVALID" in msg.upper():
+            payments_enabled = False
+            notify_text = (
+                "[Auto] Ошибка платежного провайдера: PAYMENT_PROVIDER_INVALID.\n"
+                "Проверьте PROVIDER_TOKEN в .env и настройки в BotFather.\n"
+                f"Ошибка: {msg}"
+            )
+            if OWNER_ID:
+                try:
+                    await callback.message.bot.send_message(OWNER_ID, notify_text)
+                except Exception:
+                    logger.exception("Failed to notify owner about invalid payment provider")
+            await callback.message.answer("Ошибка платежного провайдера. Администратор уведомлён, платежи отключены.")
+            return
+        await callback.message.answer("Не удалось открыть платёж. Попробуйте позже.")
+    except Exception:
+        logger.exception("Unexpected error when sending invoice via callback")
+        await callback.message.answer("Внутренняя ошибка при открытии платежа.")
 
 
 async def pre_checkout_query_handler(pre_checkout: PreCheckoutQuery) -> None:
