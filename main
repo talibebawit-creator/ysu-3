@@ -39,16 +39,16 @@ except ValueError:
     PRODUCT_PRICE_AMOUNT = 100
 PRODUCT_LABEL: str = os.getenv("PRODUCT_LABEL", "Test product")
 
-# Информация о владельце/админе (можно указать несколько id через запятую)
+# Информация о владельце/админе (по умолчанию используем предоставленные значения)
 OWNER_ID_ENV = os.getenv("OWNER_ID")
 if OWNER_ID_ENV:
     try:
         OWNER_ID = int(OWNER_ID_ENV)
     except ValueError:
-        OWNER_ID = None
+        OWNER_ID = 6101005448
 else:
-    OWNER_ID = None
-OWNER_USERNAME: str = os.getenv("OWNER_USERNAME", "@owner")
+    OWNER_ID = 6101005448
+OWNER_USERNAME: str = os.getenv("OWNER_USERNAME", "@dvestl")
 ADMINS_ENV = os.getenv("ADMINS", "")
 ADMINS: List[int] = []
 if ADMINS_ENV:
@@ -207,8 +207,12 @@ async def successful_payment_handler(message: Message) -> None:
 
 
 async def owner_handler(message: Message) -> None:
-    owner_info = f"{OWNER_USERNAME} (id: {OWNER_ID})" if OWNER_ID else OWNER_USERNAME
-    await message.answer(f"Владелец бота: {owner_info}")
+    # make owner name clickable via tg://user?id=<id>
+    if OWNER_ID:
+        mention = f'<a href="tg://user?id={OWNER_ID}">{OWNER_USERNAME}</a>'
+    else:
+        mention = OWNER_USERNAME
+    await message.answer(f"Владелец бота: {mention}")
 
 
 async def admin_only_handler(message: Message) -> None:
